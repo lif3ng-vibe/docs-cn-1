@@ -1,0 +1,136 @@
+name: Deploy to GitHub Pages
+
+on:
+  workflow_dispatch:
+    inputs:
+      sites:
+        description: '要构建的站点 slug（逗号分隔，留空=全部）'
+        required: false
+        default: ''
+      ref:
+        description: 'hub 仓库 lif3ng-vibe/docs-cn 的 ref（分支/commit）'
+        required: false
+        default: master
+
+# 允许 Pages 部署
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一时间只跑一条部署
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+# docs-cn-1 分仓：tailscale + coolify。本仓不含任何站点内容——构建时 checkout
+# hub 仓库 lif3ng-vibe/docs-cn@inputs.ref（hub 唯一事实源，无 submodule），按
+# 分仓定档构建，产物部署到本仓 Pages：https://lif3ng-vibe.github.io/docs-cn-1/。
+# 触发：hub deploy 成功后 dispatch-siblings job（secret DOCS_DISPATCH_TOKEN）
+# 指名 sites 清单触发本 workflow；也可手动
+#   gh workflow run deploy-pages.yml -R lif3ng-vibe/docs-cn-1 -f sites=tailscale,coolify -f ref=master
+# 缓存（actions/cache）存在本仓名下，key 只掺站点目录内容、不掺 workflow 文件
+# （改 CI 文件不炸缓存，与 hub 31e88a46 同口径）；7 天未用被逐出后 miss 自愈重建。
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve site list
+        run: |
+          if [ -n "${{ inputs.sites }}" ]; then
+            echo "DOCS_SITES=${{ inputs.sites }}" >> "$GITHUB_ENV"
+          else
+            echo "DOCS_SITES=tailscale,coolify" >> "$GITHUB_ENV"
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          repository: lif3ng-vibe/docs-cn
+          ref: ${{ inputs.ref || 'master' }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: tailscale-docs-cn/package-lock.json
+
+      - name: Prepare _site
+        run: mkdir -p _site
+
+      # tailscale 是标准 Starlight + npm（700 篇正文 md）：正文内链为根绝对路径
+      # （](/docs/… 内联与 [id]: /docs/… 引用式两种形态），sed v2 统一补本仓前缀。
+      - name: Restore tailscale-docs-cn dist
+        id: dist-tailscale
+        if: contains(env.DOCS_SITES, 'tailscale')
+        uses: actions/cache@v4
+        with:
+          path: _site/tailscale
+          key: dist-tailscale-${{ hashFiles('tailscale-docs-cn/**') }}
+
+      - name: Build tailscale-docs-cn
+        if: contains(env.DOCS_SITES, 'tailscale') && steps.dist-tailscale.outputs.cache-hit != 'true'
+        working-directory: tailscale-docs-cn
+        env:
+          DOCS_SITE: https://lif3ng-vibe.github.io
+          DOCS_BASE: /docs-cn-1/tailscale/
+        run: |
+          find src/content/docs -name '*.md' -exec sed -E -i 's@(\]\(|\]: )/@\1/docs-cn-1/tailscale/@g' {} +
+          npm ci
+          npm run build
+          mv dist ../_site/tailscale
+          # 正文树保留 /docs 段与上游 URL 1:1（对照配对），站点根放一个跳转页
+          printf '<!DOCTYPE html><meta charset="utf-8"><title>Tailscale 中文文档</title><script>location.replace("./docs/")</script><a href="./docs/">进入文档</a>' > ../_site/tailscale/index.html
+
+      # coolify 是 fumadocs + TanStack Start 站（bun 工具链）；base 前缀写死在
+      # vite.config.ts / config/site.shared.ts / scripts/services-data.mjs /
+      # src/components/team-page.tsx 四处（字面量 /docs-cn/coolify），分仓前缀在
+      # 构建前做源码级字面量替换（checkout 是一次性的，改写不落库）；
+      # COOLIFY_CLI_CATALOG_FILE 用仓库内 CLI 目录快照免远程拉取；
+      # VITE_SITE_URL 指镜像站使 sitemap 自洽；OG 卡片需 CJK 字体（fonts-noto-cjk）。
+      - name: Restore coolify-docs-cn dist
+        id: dist-coolify
+        if: contains(env.DOCS_SITES, 'coolify')
+        uses: actions/cache@v4
+        with:
+          path: _site/coolify
+          key: dist-coolify-${{ hashFiles('coolify-docs-cn/**') }}
+
+      - name: Build coolify-docs-cn
+        if: contains(env.DOCS_SITES, 'coolify') && steps.dist-coolify.outputs.cache-hit != 'true'
+        working-directory: coolify-docs-cn
+        env:
+          COOLIFY_CLI_CATALOG_FILE: scripts/fixtures/coolify-cli-llms-full.txt
+          VITE_SITE_URL: https://lif3ng-vibe.github.io
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
+          grep -rl --include='*.ts' --include='*.tsx' --include='*.mjs' '/docs-cn/coolify' . \
+            | xargs -r sed -i 's|/docs-cn/coolify|/docs-cn-1/coolify|g'
+          curl -fsSL https://bun.sh/install | bash
+          export BUN_INSTALL="$HOME/.bun"
+          export PATH="$BUN_INSTALL/bin:$PATH"
+          bun install --frozen-lockfile
+          bun run build
+          mkdir -p ../_site/coolify
+          mv .output/public/* ../_site/coolify/
+
+      - name: Assemble Pages artifact
+        run: |
+          # 本仓无入口页（hub 承担目录）：_site 只放各站点产物目录
+          du -sm _site/* | sort -rn | head -15 || true
+          du -sm _site | tail -1
+          # GitHub Pages 需要 .nojekyll 避免下划线开头的 _astro 等目录被忽略
+          touch _site/.nojekyll
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
