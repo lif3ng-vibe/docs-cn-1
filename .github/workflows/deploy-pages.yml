@@ -134,3 +134,7 @@ jobs:
     steps:
       - id: deployment
         uses: actions/deploy-pages@v4
+        with:
+          # 默认 600s：hub 曾因新站冷同步卡死超时（首建轮 syncing_files 停整轮）；
+          # 提到 20 分钟容 Pages 侧同步波动
+          timeout: 1200000
