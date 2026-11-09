@@ -11,6 +11,11 @@ on:
         description: 'hub 仓库 lif3ng-vibe/docs-cn 的 ref（分支/commit）'
         required: false
         default: master
+      no_cache:
+        description: '跳过缓存强制重建（CI 前缀逻辑修复轮用——缓存 key 只随内容变，不随本文件变）'
+        type: boolean
+        required: false
+        default: false
 
 # 允许 Pages 部署
 permissions:
@@ -59,9 +64,12 @@ jobs:
 
       # tailscale 是标准 Starlight + npm（700 篇正文 md）：正文内链为根绝对路径
       # （](/docs/… 内联与 [id]: /docs/… 引用式两种形态），sed v2 统一补本仓前缀。
+      # 缓存 restore 不做站选 gate：未选中的站靠缓存凑产物（否则单站 dispatch
+      # 会上传缺站工件，把该站从线上抹掉）；仅「选中站 + no_cache」跳过 restore
+      # 强制重建。Assemble 步校验全站齐全兜底。
       - name: Restore tailscale-docs-cn dist
         id: dist-tailscale
-        if: contains(env.DOCS_SITES, 'tailscale')
+        if: inputs.no_cache != true || !contains(env.DOCS_SITES, 'tailscale')
         uses: actions/cache@v4
         with:
           path: _site/tailscale
@@ -82,14 +90,15 @@ jobs:
           printf '<!DOCTYPE html><meta charset="utf-8"><title>Tailscale 中文文档</title><script>location.replace("./docs/")</script><a href="./docs/">进入文档</a>' > ../_site/tailscale/index.html
 
       # coolify 是 fumadocs + TanStack Start 站（bun 工具链）；base 前缀写死在
-      # vite.config.ts / config/site.shared.ts / scripts/services-data.mjs /
-      # src/components/team-page.tsx 四处（字面量 /docs-cn/coolify），分仓前缀在
-      # 构建前做源码级字面量替换（checkout 是一次性的，改写不落库）；
+      # 源码四处（vite.config.ts / site.shared.ts / services-data.mjs / team-page.tsx）
+      # + 内容 386 个 mdx 与 src/generated/services.json 的资源引用（图片等，
+      # 当初翻译时写的就是 /docs-cn/coolify 绝对路径——raw img 不走 vite base），
+      # 分仓前缀在构建前做源码级全量字面量替换（checkout 一次性，改写不落库）；
       # COOLIFY_CLI_CATALOG_FILE 用仓库内 CLI 目录快照免远程拉取；
       # VITE_SITE_URL 指镜像站使 sitemap 自洽；OG 卡片需 CJK 字体（fonts-noto-cjk）。
       - name: Restore coolify-docs-cn dist
         id: dist-coolify
-        if: contains(env.DOCS_SITES, 'coolify')
+        if: inputs.no_cache != true || !contains(env.DOCS_SITES, 'coolify')
         uses: actions/cache@v4
         with:
           path: _site/coolify
@@ -103,7 +112,7 @@ jobs:
           VITE_SITE_URL: https://lif3ng-vibe.github.io
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq fonts-noto-cjk
-          grep -rl --include='*.ts' --include='*.tsx' --include='*.mjs' '/docs-cn/coolify' . \
+          grep -rl --include='*.ts' --include='*.tsx' --include='*.mjs' --include='*.mdx' --include='*.md' --include='*.json' '/docs-cn/coolify' . \
             | xargs -r sed -i 's|/docs-cn/coolify|/docs-cn-1/coolify|g'
           curl -fsSL https://bun.sh/install | bash
           export BUN_INSTALL="$HOME/.bun"
@@ -115,6 +124,11 @@ jobs:
 
       - name: Assemble Pages artifact
         run: |
+          # 防单站 dispatch 缺站：工件必须含本仓全部定档站点，缺任一整轮红
+          # （否则 upload 会把线上其他站抹掉）
+          for slug in tailscale coolify; do
+            [ -d "_site/$slug" ] || { echo "::error::_site/$slug 缺失（缓存未命中且未构建）"; exit 1; }
+          done
           # 本仓无入口页（hub 承担目录）：_site 只放各站点产物目录
           du -sm _site/* | sort -rn | head -15 || true
           du -sm _site | tail -1
